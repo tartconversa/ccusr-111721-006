@@ -3,6 +3,7 @@ import json
 
 from .audit import write
 from .grants import Grants
+from .identity import Identity
 from .policy import Policies
 from .products import Products
 
@@ -10,6 +11,7 @@ from .products import Products
 class Delivery:
     def __init__(self, connection):
         self.connection = connection
+        self.identity = Identity(connection)
         self.grants = Grants(connection)
         self.policies = Policies(connection)
         self.products = Products(connection)
@@ -26,26 +28,57 @@ class Delivery:
         inputs = self.products.inputs(product_id, revision)
         if not inputs:
             raise ValueError("数据产品缺少输入")
-        reasons, revisions = [], {}
+        entity = self.identity.entity(recipient, at)
+        reasons, revisions, paths = [], {}, {}
         for asset in inputs:
             source_id = asset["source_id"]
             if asset["state"] != "active" or not asset["source_active"]:
                 reasons.append({"source": source_id, "reason": "inactive"})
-            if not self.grants.permits(source_id, recipient, purpose, at):
-                reasons.append({"source": source_id, "reason": "grant"})
+            matches = self.grants.resolve(source_id, recipient, purpose, at, entity)
+            if not matches:
+                reasons.append(
+                    {
+                        "source": source_id,
+                        "reason": "grant",
+                        "identity": {
+                            "recipient": recipient,
+                            "entity": entity,
+                            "known_name": self.identity.known(recipient),
+                        },
+                    }
+                )
+            else:
+                paths[source_id] = matches
             decision, policy_revision = self.policies.decision(asset["jurisdiction"], asset["classification"], purpose)
             revisions[source_id] = policy_revision
             if decision != "allow":
                 reasons.append({"source": source_id, "reason": "policy"})
         if reasons:
             with self.connection:
-                write(self.connection, at, recipient, "delivery.reject", product_id, {"revision": revision, "reasons": reasons})
+                write(
+                    self.connection, at, recipient, "delivery.reject", product_id,
+                    {"revision": revision, "reasons": reasons},
+                )
             raise PermissionError(reasons)
         digest = hashlib.sha256("|".join(asset["digest"] for asset in inputs).encode()).hexdigest()
         with self.connection:
             self.connection.execute(
-                "INSERT INTO deliveries(id,product_id,product_revision,recipient,purpose,created_at,input_digest,policy_revisions) VALUES(?,?,?,?,?,?,?,?)",
-                (delivery_id, product_id, revision, recipient, purpose, at, digest, json.dumps(revisions, sort_keys=True)),
+                "INSERT INTO deliveries(id,product_id,product_revision,recipient,recipient_entity,purpose,created_at,input_digest,policy_revisions,grant_paths) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    delivery_id, product_id, revision, recipient, entity, purpose, at, digest,
+                    json.dumps(revisions, sort_keys=True),
+                    json.dumps(paths, ensure_ascii=False, sort_keys=True),
+                ),
             )
-            write(self.connection, at, recipient, "delivery.accept", delivery_id, {"product": product_id, "revision": revision, "inputs": [a["id"] for a in inputs]})
+            write(
+                self.connection, at, recipient, "delivery.accept", delivery_id,
+                {
+                    "product": product_id,
+                    "revision": revision,
+                    "inputs": [a["id"] for a in inputs],
+                    "entity": entity,
+                    "grants": paths,
+                },
+            )
         return dict(self.connection.execute("SELECT * FROM deliveries WHERE id=?", (delivery_id,)).fetchone())

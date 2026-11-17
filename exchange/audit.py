@@ -10,7 +10,7 @@ def write(connection, at, actor, action, subject, details):
 
 def history(connection, subject):
     rows = connection.execute(
-        "SELECT at,actor,action,details FROM audit WHERE subject=? ORDER BY id",
+        "SELECT id,at,actor,action,details FROM audit WHERE subject=? ORDER BY id",
         (subject,),
     ).fetchall()
     return [dict(row) for row in rows]
